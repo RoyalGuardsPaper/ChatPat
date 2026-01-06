@@ -3,6 +3,9 @@ import requests
 import re
 import os
 from dotenv import load_dotenv
+import hashlib
+import uuid
+from streamlit_cookies_manager import EncryptedCookieManager
 
 # -------------------- ENV SETUP --------------------
 load_dotenv()
@@ -10,6 +13,14 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
+
+RAW_USERS = os.getenv("CHATPAT_USERS", "")
+USERS = {}
+
+for pair in RAW_USERS.split(","):
+    if ":" in pair:
+        u, p = pair.split(":", 1)
+        USERS[u.strip()] = hashlib.sha256(p.strip().encode()).hexdigest()
 
 if not OPENROUTER_API_KEY:
     st.error("OPENROUTER_API_KEY missing in .env")
@@ -26,9 +37,90 @@ st.set_page_config(page_title="ChatPat", layout="wide")
 st.title("ChatPat")
 st.caption("Cloud-deployed, web-grounded AI assistant (OpenRouter)")
 
+cookies = EncryptedCookieManager(
+    prefix="chatpat_",
+    password=os.getenv("COOKIE_SECRET", "dev-secret-change-me")
+)
+
+if not cookies.ready():
+    st.stop()
+
+def safe_get_cookie(key: str):
+    try:
+        return cookies.get(key)
+    except Exception:
+        return None
+
+def hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+
+def authenticate(username: str, password: str) -> bool:
+    return USERS.get(username) == hash_password(password)
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if not st.session_state.user:
+    cookie_user = safe_get_cookie("user")
+    if cookie_user:
+        st.session_state.user = cookie_user
+
+if not st.session_state.user:
+    st.title("🔐 Login or Create an Account")
+
+    tab1, tab2 = st.tabs(["Login", "Sign up"])
+
+    with tab1:
+        username = st.text_input("Username", key="login_user")
+        password = st.text_input("Password", type="password", key="login_pass")
+
+        if st.button("Login", key="login_btn"):
+            if authenticate(username, password):
+                st.session_state.user = username
+                cookies["user"] = username
+                cookies.save()
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+    with tab2:
+        st.info("Create a new account. Passwords are stored hashed in memory for this session.")
+        new_user = st.text_input("Choose a username", key="signup_user")
+        new_pass = st.text_input("Choose a password", type="password", key="signup_pass")
+        confirm_pass = st.text_input("Confirm password", type="password", key="signup_confirm")
+
+        if st.button("Create account", key="signup_btn"):
+            if not new_user or not new_pass:
+                st.error("Username and password cannot be empty")
+            elif new_user in USERS or ("user_db" in st.session_state and new_user in st.session_state.user_db):
+                st.error("Username already exists")
+            elif new_pass != confirm_pass:
+                st.error("Passwords do not match")
+            else:
+                # register in-memory for this deployment
+                hashed = hash_password(new_pass)
+                USERS[new_user] = hashed
+                if "user_db" not in st.session_state:
+                    st.session_state.user_db = {}
+                st.session_state.user_db[new_user] = hashed
+
+                # auto-login
+                st.session_state.user = new_user
+                cookies["user"] = new_user
+                cookies.save()
+                st.success("Account created and logged in")
+                st.rerun()
+
+    st.stop()
+
 # -------------------- SESSION STATE --------------------
 if "chats" not in st.session_state:
     st.session_state.chats = {}
+
+if st.session_state.user not in st.session_state.chats:
+    st.session_state.chats[st.session_state.user] = {}
+
 if "chat_titles" not in st.session_state:
     st.session_state.chat_titles = {}
 if "current_chat_id" not in st.session_state:
@@ -99,8 +191,8 @@ with st.sidebar:
     st.header("🗂 Chats")
 
     if st.button("➕ New Chat"):
-        cid = str(len(st.session_state.chats))
-        st.session_state.chats[cid] = []
+        cid = str(len(st.session_state.chats[st.session_state.user]))
+        st.session_state.chats[st.session_state.user][cid] = []
         st.session_state.chat_titles[cid] = "New chat"
         st.session_state.current_chat_id = cid
 
@@ -108,14 +200,27 @@ with st.sidebar:
         if st.button(title, key=f"chat_{cid}"):
             st.session_state.current_chat_id = cid
 
+    st.divider()
+    st.markdown(f"👤 Logged in as **{st.session_state.user}**")
+    st.caption("🍪 Cookie-based auth active")
+
+    if st.button("🚪 Logout"):
+        try:
+            cookies.pop("user")
+            cookies.save()
+        except Exception:
+            pass
+        st.session_state.clear()
+        st.rerun()
+
 # -------------------- CHAT INIT --------------------
 if st.session_state.current_chat_id is None:
     cid = "0"
-    st.session_state.chats[cid] = []
+    st.session_state.chats[st.session_state.user][cid] = []
     st.session_state.chat_titles[cid] = "New chat"
     st.session_state.current_chat_id = cid
 
-messages = st.session_state.chats[st.session_state.current_chat_id]
+messages = st.session_state.chats[st.session_state.user][st.session_state.current_chat_id]
 
 for m in messages:
     with st.chat_message(m["role"]):
@@ -135,9 +240,13 @@ if user_input:
 
         system_prompt = (
             "You are ChatPat, a careful assistant. "
+            "If the user asks an INFORMATIONAL or FACT-BASED question (definitions, explanations, history, lists, overviews), "
+            "you MUST respond in clear bullet points. "
+            "Each point should be concise and factual. "
             "If the user asks for IMPORTANT or KEY information, "
             "prioritize canonical and widely recognized material. "
             "Do not hallucinate. Be explicit about uncertainty."
+            "For scientific questions, do deep research and tell the user that you dove deep."
         )
 
         llm_messages = [{"role": "system", "content": system_prompt}]
