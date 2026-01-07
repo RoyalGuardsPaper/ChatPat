@@ -120,9 +120,14 @@ if "chats" not in st.session_state:
 
 if st.session_state.user not in st.session_state.chats:
     st.session_state.chats[st.session_state.user] = {}
+    st.session_state.current_chat_id = None
 
 if "chat_titles" not in st.session_state:
     st.session_state.chat_titles = {}
+
+if st.session_state.user not in st.session_state.chat_titles:
+    st.session_state.chat_titles[st.session_state.user] = {}
+
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None
 if "web_cache" not in st.session_state:
@@ -193,31 +198,44 @@ with st.sidebar:
     if st.button("➕ New Chat"):
         cid = str(len(st.session_state.chats[st.session_state.user]))
         st.session_state.chats[st.session_state.user][cid] = []
-        st.session_state.chat_titles[cid] = "New chat"
+        st.session_state.chat_titles[st.session_state.user][cid] = "New chat"
         st.session_state.current_chat_id = cid
 
-    for cid, title in reversed(list(st.session_state.chat_titles.items())):
+    for cid, title in reversed(list(st.session_state.chat_titles[st.session_state.user].items())):
         if st.button(title, key=f"chat_{cid}"):
             st.session_state.current_chat_id = cid
 
     st.divider()
-    st.markdown(f"👤 Logged in as **{st.session_state.user}**")
-    st.caption("🍪 Cookie-based auth active")
 
-    if st.button("🚪 Logout"):
-        try:
-            cookies.pop("user")
-            cookies.save()
-        except Exception:
-            pass
-        st.session_state.clear()
-        st.rerun()
+    with st.popover(f"👤 {st.session_state.user}", use_container_width=True):
+        st.caption("🍪 Signed in")
+
+        if st.button("🔄 Switch account", use_container_width=True):
+            try:
+                cookies.pop("user")
+                cookies.save()
+            except Exception:
+                pass
+
+            # clear only auth + chat selection, not entire app memory
+            st.session_state.user = None
+            st.session_state.current_chat_id = None
+            st.rerun()
+
+        if st.button("🚪 Logout", use_container_width=True):
+            try:
+                cookies.pop("user")
+                cookies.save()
+            except Exception:
+                pass
+            st.session_state.clear()
+            st.rerun()
 
 # -------------------- CHAT INIT --------------------
 if st.session_state.current_chat_id is None:
     cid = "0"
     st.session_state.chats[st.session_state.user][cid] = []
-    st.session_state.chat_titles[cid] = "New chat"
+    st.session_state.chat_titles[st.session_state.user][cid] = "New chat"
     st.session_state.current_chat_id = cid
 
 messages = st.session_state.chats[st.session_state.user][st.session_state.current_chat_id]
@@ -285,7 +303,7 @@ if user_input:
                 for r in grounding:
                     st.markdown(f"- {r['source']}")
 
-    if st.session_state.chat_titles[st.session_state.current_chat_id] == "New chat":
-        st.session_state.chat_titles[
+    if st.session_state.chat_titles[st.session_state.user][st.session_state.current_chat_id] == "New chat":
+        st.session_state.chat_titles[st.session_state.user][
             st.session_state.current_chat_id
         ] = user_input[:40] + "…"
