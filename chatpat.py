@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 import hashlib
 import uuid
 from streamlit_cookies_manager import EncryptedCookieManager
+from supabase import create_client
 
 # -------------------- ENV SETUP --------------------
 load_dotenv()
@@ -28,12 +29,48 @@ if not OPENROUTER_API_KEY:
 
 OPENROUTER_HEADERS = {
     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "Content-Type": "application/json",
     "HTTP-Referer": "http://localhost:8501",
     "X-Title": "ChatPat"
 }
 
+# -------------------- SUPABASE SETUP --------------------
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
+
+supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
 # -------------------- STREAMLIT CONFIG --------------------
 st.set_page_config(page_title="ChatPat", layout="wide")
+st.markdown("""
+<style>
+/* Chat list layout helpers */
+.chat-row {
+    display: flex;
+    align-items: center;
+}
+
+/* Perfectly centered square dots button */
+.dots-btn {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    border: none;
+    background: rgba(255,255,255,0.08);
+    color: inherit;
+    font-size: 20px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+
+.dots-btn:hover {
+    background: rgba(255,255,255,0.16);
+}
+</style>
+""", unsafe_allow_html=True)
 st.title("ChatPat")
 st.caption("Cloud-deployed, web-grounded AI assistant (OpenRouter)")
 
@@ -118,20 +155,38 @@ if not st.session_state.user:
 if "chats" not in st.session_state:
     st.session_state.chats = {}
 
-if st.session_state.user not in st.session_state.chats:
-    st.session_state.chats[st.session_state.user] = {}
-    st.session_state.current_chat_id = None
-
 if "chat_titles" not in st.session_state:
     st.session_state.chat_titles = {}
 
-if st.session_state.user not in st.session_state.chat_titles:
-    st.session_state.chat_titles[st.session_state.user] = {}
-
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = None
+
 if "web_cache" not in st.session_state:
     st.session_state.web_cache = {}
+
+if "open_menu" not in st.session_state:
+    st.session_state.open_menu = None
+
+if "renaming_chat" not in st.session_state:
+    st.session_state.renaming_chat = None
+
+
+# Load chats for user from Supabase
+if st.session_state.user not in st.session_state.chats:
+    st.session_state.chats[st.session_state.user] = {}
+    st.session_state.chat_titles[st.session_state.user] = {}
+
+    resp = (
+        supabase.table("chats")
+        .select("chat_id, title, messages")
+        .eq("user_id", st.session_state.user)
+        .execute()
+    )
+
+    for row in resp.data or []:
+        cid = row["chat_id"]
+        st.session_state.chats[st.session_state.user][cid] = row["messages"]
+        st.session_state.chat_titles[st.session_state.user][cid] = row["title"]
 
 # -------------------- HELPERS --------------------
 def is_trivia(text: str) -> bool:
@@ -190,20 +245,81 @@ def detect_canonical_context(q: str) -> bool:
     return bool(re.search(r"by\\s+|works of|papers by|memos by", q, re.I))
 
 
+def save_chat(user, chat_id):
+    supabase.table("chats").upsert({
+        "user_id": user,
+        "chat_id": chat_id,
+        "title": st.session_state.chat_titles[user][chat_id],
+        "messages": st.session_state.chats[user][chat_id]
+    }).execute()
+
+def delete_chat(user, chat_id):
+    supabase.table("chats") \
+        .delete() \
+        .eq("user_id", user) \
+        .eq("chat_id", chat_id) \
+        .execute()
+
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
     force_web = st.checkbox("🔍 Always use web", value=False)
     st.header("🗂 Chats")
 
     if st.button("➕ New Chat"):
-        cid = str(len(st.session_state.chats[st.session_state.user]))
+        cid = str(uuid.uuid4())
         st.session_state.chats[st.session_state.user][cid] = []
         st.session_state.chat_titles[st.session_state.user][cid] = "New chat"
         st.session_state.current_chat_id = cid
+        save_chat(st.session_state.user, cid)
+
+    st.divider()
 
     for cid, title in reversed(list(st.session_state.chat_titles[st.session_state.user].items())):
-        if st.button(title, key=f"chat_{cid}"):
-            st.session_state.current_chat_id = cid
+        cols = st.columns([0.9, 0.1])
+
+        # ---- CHAT TITLE / RENAME ----
+        with cols[0]:
+            if st.session_state.renaming_chat == cid:
+                new_title = st.text_input(
+                    "Rename chat",
+                    value=title,
+                    key=f"rename_{cid}",
+                    label_visibility="collapsed"
+                )
+                if new_title and new_title != title:
+                    st.session_state.chat_titles[st.session_state.user][cid] = new_title
+                    save_chat(st.session_state.user, cid)
+                if st.button("✔️", key=f"rename_ok_{cid}"):
+                    st.session_state.renaming_chat = None
+                    st.rerun()
+            else:
+                if st.button(title, key=f"chat_{cid}", use_container_width=True):
+                    st.session_state.current_chat_id = cid
+                    st.session_state.open_menu = None
+
+        # ---- DOTS + POPUP ----
+        with cols[1]:
+            clicked = st.button("⋯", key=f"dots_{cid}", help="Chat options")
+            if clicked:
+                st.session_state.open_menu = cid if st.session_state.open_menu != cid else None
+
+            if st.session_state.open_menu == cid:
+                if st.button("✏️ Rename", key=f"rename_action_{cid}", help="rename", use_container_width=True):
+                    st.session_state.renaming_chat = cid
+                    st.session_state.open_menu = None
+                    st.rerun()
+
+                if st.button("🗑 Delete chat", key=f"delete_action_{cid}", help="delete", use_container_width=True):
+                    delete_chat(st.session_state.user, cid)
+                    st.session_state.chats[st.session_state.user].pop(cid, None)
+                    st.session_state.chat_titles[st.session_state.user].pop(cid, None)
+
+                    if st.session_state.current_chat_id == cid:
+                        remaining = list(st.session_state.chats[st.session_state.user].keys())
+                        st.session_state.current_chat_id = remaining[0] if remaining else None
+
+                    st.session_state.open_menu = None
+                    st.rerun()
 
     st.divider()
 
@@ -231,12 +347,19 @@ with st.sidebar:
             st.session_state.clear()
             st.rerun()
 
+
 # -------------------- CHAT INIT --------------------
 if st.session_state.current_chat_id is None:
-    cid = "0"
-    st.session_state.chats[st.session_state.user][cid] = []
-    st.session_state.chat_titles[st.session_state.user][cid] = "New chat"
-    st.session_state.current_chat_id = cid
+    if st.session_state.chats[st.session_state.user]:
+        st.session_state.current_chat_id = next(
+            iter(st.session_state.chats[st.session_state.user])
+        )
+    else:
+        cid = str(uuid.uuid4())
+        st.session_state.chats[st.session_state.user][cid] = []
+        st.session_state.chat_titles[st.session_state.user][cid] = "New chat"
+        st.session_state.current_chat_id = cid
+        save_chat(st.session_state.user, cid)
 
 messages = st.session_state.chats[st.session_state.user][st.session_state.current_chat_id]
 
@@ -290,13 +413,24 @@ if user_input:
                 json=payload,
                 timeout=60
             )
-            data = r.json()
-            reply = data["choices"][0]["message"]["content"]
+
+            if r.status_code != 200:
+                reply = f"LLM error {r.status_code}: {r.text}"
+            else:
+                data = r.json()
+                if "choices" not in data or not data["choices"]:
+                    reply = f"LLM error: empty response ({data})"
+                else:
+                    reply = data["choices"][0]["message"]["content"]
+
         except Exception as e:
-            reply = f"LLM error: {e}"
+            reply = f"LLM exception: {e}"
 
         st.markdown(reply)
+        if reply.startswith("LLM error"):
+            st.error(reply)
         messages.append({"role": "assistant", "content": reply})
+        save_chat(st.session_state.user, st.session_state.current_chat_id)
 
         if grounding:
             with st.expander("🔗 Sources"):
@@ -306,4 +440,7 @@ if user_input:
     if st.session_state.chat_titles[st.session_state.user][st.session_state.current_chat_id] == "New chat":
         st.session_state.chat_titles[st.session_state.user][
             st.session_state.current_chat_id
-        ] = user_input[:40] + "…"
+        ] = user_input[:40] + "…" 
+        save_chat(st.session_state.user, st.session_state.current_chat_id)
+
+# (Menu action handler removed; now handled after sidebar)
